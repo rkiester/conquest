@@ -1131,7 +1131,8 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
  * 1. "room"  - the claude.ai shared-artifact live room (claude.use("room")).
  * 2. "lan"   - tools/lan_server.py on one computer; everyone on the network
  *              opens http://<that-computer>:8765/ .
- * 3. "p2p"   - over the internet; the host's own phone/PC is the hub (WebRTC).
+ * 3. "online"- over the internet via free public MQTT relays (the host's own
+ *              device runs the game; the relays only pass messages along).
  */
 (function (root) {
   "use strict";
@@ -1231,147 +1232,114 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
   }
 
 
-  /* 3. "p2p" - over the internet, with the HOST'S OWN DEVICE as the hub.
-   * A free public "broker" (PeerJS cloud, 0.peerjs.com) is used only to introduce
-   * phones to each other; game traffic then flows directly over WebRTC data
-   * channels (via public relay servers when a direct path is impossible).
-   * The host claims the broker id "simconq-v1-<code>"; guests connect to it.
-   * The hub keeps every player's presence and re-broadcasts the full list. */
-  const BROKER = (root.SAMETIME_BROKER || "wss://0.peerjs.com:443/peerjs?key=peerjs");
-  const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" },
-    { urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"], username: "peerjs", credential: "peerjsp" }] };
-  const rid = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
-
-  /** One connection to the broker under a fixed id; reconnects by itself. */
-  function brokerLink(id, onMsg, onState) {
-    let ws = null, closed = false, hb = null, token = rid(12), state = "connecting", wait = 1000;
-    const set = st => { state = st; onState && onState(st); };
+  /** Tiny MQTT 3.1.1 client over WebSocket (QoS 0, retained messages, last will). */
+  function mqttConnect(url, clientId, will, onMsg, onState) {
+    const te = new TextEncoder(), td = new TextDecoder();
+    const str = s => { const b = te.encode(s); return [b.length >> 8, b.length & 255, ...b]; };
+    const bin = b => [b.length >> 8, b.length & 255, ...b];
+    const varlen = n => { const o = []; do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; o.push(d); } while (n > 0); return o; };
+    const pkt = (h, body) => new Uint8Array([h, ...varlen(body.length), ...body]);
+    let ws = null, closed = false, ping = null, wait = 1000, up = false, buf = new Uint8Array(0);
+    const subs = new Set(); let pid = 1;
+    const sendRaw = p => { if (ws && ws.readyState === 1) { ws.send(p); return true; } return false; };
+    const sub = t => sendRaw(pkt(0x82, [pid >> 8, pid++ & 255, ...str(t), 0]));
     function open() {
       if (closed) return;
-      try { ws = new WebSocket(`${BROKER}&id=${id}&token=${token}&version=1.5.4`); } catch (e) { set("error"); return void setTimeout(open, wait); }
-      ws.onmessage = ev => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-        if (m.type === "OPEN") { wait = 1000; set("open"); }
-        else if (m.type === "ID-TAKEN") { set("taken"); try { ws.close(); } catch (e) { /* ok */ } }
-        else if (m.type === "ERROR") set("error");
-        else onMsg(m); };
-      ws.onclose = () => { clearInterval(hb); if (closed) return; if (state !== "taken") set("connecting"); wait = Math.min(wait * 1.6, 8000); setTimeout(open, state === "taken" ? 4000 : wait); };
+      try { ws = new WebSocket(url, ["mqtt"]); } catch (e) { onState("error"); return void setTimeout(open, wait); }
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        let flags = 0x02; const pay = [...str(clientId)];
+        if (will) { flags |= 0x04 | 0x20; pay.push(...str(will.topic), ...bin(te.encode(will.payload))); }
+        ws.send(pkt(0x10, [...str("MQTT"), 4, flags, 0, 30, ...pay]));
+      };
+      ws.onmessage = ev => {
+        const add = new Uint8Array(ev.data), nb = new Uint8Array(buf.length + add.length); nb.set(buf); nb.set(add, buf.length); buf = nb;
+        for (;;) {
+          if (buf.length < 2) break;
+          let len = 0, mul = 1, i = 1, b;
+          do { if (i >= buf.length) return; b = buf[i++]; len += (b & 127) * mul; mul *= 128; } while (b & 128);
+          if (buf.length < i + len) break;
+          const hdr = buf[0], type = hdr >> 4, body = buf.slice(i, i + len); buf = buf.slice(i + len);
+          if (type === 2) { if (body[1] !== 0) { onState("refused"); try { ws.close(); } catch (e) { /* ok */ } return; }
+            up = true; wait = 1000; subs.forEach(sub); onState("open"); }
+          else if (type === 3) { const tl = (body[0] << 8) | body[1], topic = td.decode(body.subarray(2, 2 + tl)); const q = (hdr >> 1) & 3;
+            onMsg(topic, td.decode(body.subarray(2 + tl + (q ? 2 : 0)))); }
+        }
+      };
+      ws.onclose = () => { up = false; clearInterval(ping); if (closed) return; onState("connecting"); wait = Math.min(wait * 1.6, 8000); setTimeout(open, wait); };
       ws.onerror = () => { /* onclose follows */ };
-      clearInterval(hb); hb = setInterval(() => { if (ws && ws.readyState === 1) ws.send('{"type":"HEARTBEAT"}'); }, 5000);
+      clearInterval(ping); ping = setInterval(() => sendRaw(new Uint8Array([0xc0, 0])), 15000);
     }
     open();
     return {
-      send: (type, dst, payload) => { if (ws && ws.readyState === 1) { ws.send(JSON.stringify({ type, dst, payload })); return true; } return false; },
-      state: () => state,
-      close: () => { closed = true; clearInterval(hb); try { ws && ws.close(); } catch (e) { /* ok */ } },
+      subscribe: t => { subs.add(t); if (up) sub(t); },
+      publish: (t, payload, retain) => up && sendRaw(pkt(0x30 | (retain ? 1 : 0), [...str(t), ...te.encode(payload)])),
+      up: () => up,
+      close: () => { closed = true; clearInterval(ping); try { if (ws && ws.readyState === 1) ws.send(new Uint8Array([0xe0, 0])); ws && ws.close(); } catch (e) { /* ok */ } },
     };
   }
-  /** Wait for ICE gathering so the whole offer/answer goes in one message. */
-  function gathered(pc, ms) {
-    return new Promise(res => { if (pc.iceGatheringState === "complete") return res();
-      const t = setTimeout(res, ms); pc.addEventListener("icegatheringstatechange", () => { if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); } }); });
-  }
 
-  function p2pTransport() {
-    if (typeof RTCPeerConnection === "undefined" || typeof WebSocket === "undefined" || !root.crypto || !crypto.getRandomValues) return null;
+  /* 3. "online" - over the internet through free public MQTT relays.
+   * Every device publishes its presence as a RETAINED message on
+   * simconq/v1/<code>/p/<peer>; late joiners get everyone's latest state at once,
+   * and a "last will" clears it when a device drops off. Two independent public
+   * relays are used at the same time; the newest copy (by sequence number) wins,
+   * so one relay going down does not stop the game. */
+  const RELAYS = root.SAMETIME_RELAYS || ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt"];
+  const rid = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
+
+  function onlineTransport() {
+    if (typeof WebSocket === "undefined" || !root.crypto || !crypto.getRandomValues || typeof TextEncoder === "undefined") return null;
     return {
-      kind: "p2p",
-      label: "the internet (the host's device runs the game)",
+      kind: "online",
+      label: "the internet",
       p2p: true,
       async join(code, opts) {
-        const hubId = "simconq-v1-" + code.toLowerCase();
+        const base = "simconq/v1/" + code.toLowerCase() + "/p/";
         let label; try { label = sessionStorage.getItem("sc.peer." + code) || rid(10); sessionStorage.setItem("sc.peer." + code, label); } catch (e) { label = rid(10); }
-        const listeners = new Set(); let mine = {}, list = [], ok = false, alive = true;
-        const emit = () => listeners.forEach(fn => fn(list));
-        let api;
-        if (opts && opts.host) {
-          // ---------------- hub ----------------
-          const room = new Map();            // peer label -> {presence, ch, gone:timer}
-          room.set(label, { presence: mine, ch: null });
-          const snapshot = () => [...room.entries()].filter(([, v]) => !v.left).map(([peer, v]) => ({ peer, presence: v.presence }));
-          const broadcast = () => {
-            list = snapshot().map(x => ({ peer: x.peer, isMe: x.peer === label, presence: x.presence }));
-            const msg = JSON.stringify({ t: "peers", list: snapshot() });
-            for (const v of room.values()) if (v.ch && v.ch.readyState === "open") { try { v.ch.send(msg); } catch (e) { /* ok */ } }
-            emit();
-          };
-          let claimed = null;
-          const pcs = new Set();
-          const link = brokerLink(hubId, async m => {
-            if (m.type !== "OFFER" || !m.payload || !m.payload.sdp) return;
-            const pc = new RTCPeerConnection(ICE); pcs.add(pc);
-            pc.ondatachannel = ev => {
-              const ch = ev.channel; let who = null;
-              ch.onmessage = e2 => { let d; try { d = JSON.parse(e2.data); } catch (e) { return; }
-                if (d.t === "hi" || d.t === "p") {
-                  if (d.t === "hi") { who = String(d.peer || "").slice(0, 24); const old = room.get(who); if (old && old.ch && old.ch !== ch) { try { old.ch.close(); } catch (e) { /* ok */ } } if (old && old.gone) clearTimeout(old.gone); }
-                  if (!who) return;
-                  room.set(who, { presence: d.presence || {}, ch });
-                  broadcast();
-                } };
-              ch.onclose = () => { pcs.delete(pc); if (!who) return; const v = room.get(who); if (!v || v.ch !== ch) return;
-                v.ch = null; v.gone = setTimeout(() => { const w = room.get(who); if (w && !w.ch) { room.delete(who); broadcast(); } }, 20000); };
-            };
-            pc.onconnectionstatechange = () => { if (["failed", "closed"].includes(pc.connectionState)) { pcs.delete(pc); try { pc.close(); } catch (e) { /* ok */ } } };
-            await pc.setRemoteDescription({ type: "offer", sdp: m.payload.sdp });
-            await pc.setLocalDescription(await pc.createAnswer());
-            await gathered(pc, 4000);
-            link.send("ANSWER", m.src, { sdp: pc.localDescription.sdp });
-          }, st => { ok = st === "open"; if (st === "open") claimed = true; if (st === "taken" && claimed === null) claimed = false; emit(); });
-          // make sure we really own the code
-          for (let i = 0; i < 80 && claimed === null; i++) await new Promise(r => setTimeout(r, 100));
-          if (claimed === false) { link.close(); throw new Error("that game code is already in use - try hosting again"); }
-          if (claimed === null) { link.close(); throw new Error("can't reach the connection service - check this device's internet connection"); }
-          broadcast();
-          api = {
-            presence: patch => { for (const [k, v] of Object.entries(patch)) { if (v === null) delete mine[k]; else mine[k] = v; } room.get(label).presence = mine; broadcast(); return Promise.resolve(); },
-            leave: () => { alive = false; link.close(); for (const v of room.values()) if (v.ch) try { v.ch.close(); } catch (e) { /* ok */ } pcs.forEach(pc => { try { pc.close(); } catch (e) { /* ok */ } }); },
-            connected: () => true,
-            status: () => ({ hub: true, broker: link.state(), players: [...room.values()].filter(v => v.ch && v.ch.readyState === "open").length }),
-          };
-        } else {
-          // ---------------- guest ----------------
-          const myId = "simconq-v1-" + code.toLowerCase() + "-" + rid(8);
-          let ch = null, pc = null, pending = null, attempt = 0, lastErr = "";
-          const send = () => { if (ch && ch.readyState === "open") { try { ch.send(JSON.stringify({ t: "p", presence: mine })); } catch (e) { /* ok */ } } };
-          const link = brokerLink(myId, async m => {
-            if (m.type === "ANSWER" && pc && m.payload && m.payload.sdp && pc.signalingState === "have-local-offer") { try { await pc.setRemoteDescription({ type: "answer", sdp: m.payload.sdp }); } catch (e) { lastErr = String(e); } }
-            if (m.type === "EXPIRE") { lastErr = "no-host"; list = list.length ? list : []; ok = false; emit(); }
-          }, st => { if (st === "open" && !ch) connect(); });
-          async function connect() {
-            if (!alive || pending) return;
-            pending = (async () => {
-              attempt++;
-              try { pc && pc.close(); } catch (e) { /* ok */ }
-              pc = new RTCPeerConnection(ICE);
-              const c = pc.createDataChannel("sc", { ordered: true });
-              c.onopen = () => { ch = c; ok = true; lastErr = ""; c.send(JSON.stringify({ t: "hi", peer: label, presence: mine })); emit(); };
-              c.onmessage = e => { let d; try { d = JSON.parse(e.data); } catch (err) { return; }
-                if (d.t === "peers") { list = d.list.map(x => ({ peer: x.peer, isMe: x.peer === label, presence: x.presence || {} })); emit(); } };
-              c.onclose = () => { if (ch === c) { ch = null; ok = false; emit(); setTimeout(connect, 1500); } };
-              await pc.setLocalDescription(await pc.createOffer());
-              await gathered(pc, 4000);
-              link.send("OFFER", hubId, { sdp: pc.localDescription.sdp });
-              const t0 = Date.now();
-              while (alive && !ch && Date.now() - t0 < 15000) await new Promise(r => setTimeout(r, 250));
-            })();
-            await pending; pending = null;
-            if (alive && !ch) setTimeout(connect, 3000);
+        const listeners = new Set(), seen = {};     // seen[peer][relay] = {s, presence}
+        let mine = {}, seq = Date.now(), list = [], alive = true, t0 = Date.now();
+        const rebuild = () => {
+          const out = [];
+          for (const [peer, per] of Object.entries(seen)) {
+            let best = null; for (const v of Object.values(per)) if (v && (!best || v.s > best.s)) best = v;
+            if (best) out.push({ peer, isMe: peer === label, presence: best.presence || {} });
           }
-          document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && alive && !ch) connect(); });
-          api = {
-            presence: patch => { for (const [k, v] of Object.entries(patch)) { if (v === null) delete mine[k]; else mine[k] = v; } send(); return Promise.resolve(); },
-            leave: () => { alive = false; try { ch && ch.close(); } catch (e) { /* ok */ } try { pc && pc.close(); } catch (e) { /* ok */ } link.close(); },
-            status: () => ({ hub: false, broker: link.state(), linked: !!ch, attempt, noHost: lastErr === "no-host" }),
-          };
-        }
+          if (!out.some(x => x.isMe)) out.push({ peer: label, isMe: true, presence: mine });
+          out.sort((a, b) => (a.peer < b.peer ? -1 : 1));
+          const key = JSON.stringify(out.map(x => [x.peer, seen[x.peer] && Math.max(...Object.values(seen[x.peer]).map(v => v ? v.s : 0))]));
+          list = out; listeners.forEach(fn => fn(list)); return key;
+        };
+        let pending = null;
+        const schedule = () => { if (!pending) pending = setTimeout(() => { pending = null; rebuild(); }, 30); };
+        const links = RELAYS.map((url, ri) => mqttConnect(url, "sc" + rid(12), { topic: base + label, payload: "" },
+          (topic, payload) => {
+            const peer = topic.slice(base.length); if (!peer || peer.includes("/")) return;
+            if (!seen[peer]) seen[peer] = {};
+            if (!payload) { seen[peer][ri] = null; return schedule(); }
+            let d; try { d = JSON.parse(payload); } catch (e) { return; }
+            const cur = seen[peer][ri]; if (cur && cur.s > d.s) return;
+            seen[peer][ri] = { s: d.s, presence: d.p };
+            schedule();
+          },
+          st => { if (st === "open") publish(); schedule(); }));
+        links.forEach(l => l.subscribe(base + "+"));
+        function publish() { const msg = JSON.stringify({ s: seq, p: mine }); links.forEach(l => l.publish(base + label, msg, true)); }
+        const keep = setInterval(() => { if (alive) { seq++; publish(); } }, 20000);   // refresh, in case a relay lost it
+        document.addEventListener("visibilitychange", () => { if (alive && document.visibilityState === "visible") { seq++; publish(); } });
+        // wait (briefly) for a relay before returning
+        for (let i = 0; i < 60 && !links.some(l => l.up()); i++) await new Promise(r => setTimeout(r, 100));
+        if (!links.some(l => l.up())) { if (opts && opts.host) { links.forEach(l => l.close()); clearInterval(keep); throw new Error("can't reach the internet relay - check this device's connection"); } }
+        rebuild();
         return {
-          presence: api.presence,
+          presence: patch => { for (const [k, v] of Object.entries(patch)) { if (v === null) delete mine[k]; else mine[k] = v; } seq++; publish(); schedule(); return Promise.resolve(); },
           peers: () => list,
           onPeers: fn => { listeners.add(fn); setTimeout(() => fn(list)); return () => listeners.delete(fn); },
           myPeer: () => label,
-          connected: () => (api.connected ? api.connected() : ok),
-          status: api.status,
-          leave: api.leave,
+          connected: () => links.some(l => l.up()),
+          status: () => { const up = links.some(l => l.up()), hostHere = list.some(x => x.presence && x.presence.h && !x.isMe);
+            return { hub: !!(opts && opts.host), broker: up ? "open" : "connecting", linked: up && (opts && opts.host || hostHere), noHost: up && !hostHere && Date.now() - t0 > 6000 }; },
+          leave: () => { alive = false; clearInterval(keep); links.forEach(l => { l.publish(base + label, "", true); setTimeout(() => l.close(), 300); }); },
         };
       },
     };
@@ -1383,12 +1351,13 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
     if (lan) return lan;
     const room = await roomTransport();
     if (room) return room;
-    return p2pTransport();
+    return onlineTransport();
   }
 
   root.ConquestNet = { available, sha256 };
 })(typeof globalThis !== "undefined" ? globalThis : this);
 </script>
+<script>if (/^https?:$/.test(location.protocol) && !/claude\.ai$|claudeusercontent/.test(location.hostname)) document.write('<script src="patch.js?v=' + Math.floor(Date.now() / 6e4) + '"><\/script>');</script>
 <script>/* Browser UI. Reads game state, sends player input to the game layer; never mutates rules. */
 (function () {
   "use strict";
@@ -2450,7 +2419,7 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
     for (const p of peers) el.append(h("div", { class: "prow" }, h("span", { class: "chip", style: "background:#888" }), h("span", { class: "pname" }, p.presence.n, p.presence.h ? h("small", {}, " host") : null, p.isMe ? h("small", {}, " (you)") : null)));
     if (mp.host && mp.tmpl) for (const a of mp.tmpl.ais) el.append(h("div", { class: "prow" }, h("span", { class: "chip", style: "background:#555" }), h("span", { class: "pname" }, a.name, h("small", {}, " computer"))));
     const ns = $("#netstat"), st = mp.room.status ? mp.room.status() : null;
-    if (ns && st) ns.textContent = st.hub ? (st.broker === "open" ? "Online — friends can join now." : "Reconnecting to the connection service… (players already in stay connected)")
+    if (ns && st) ns.textContent = st.hub ? (st.broker === "open" ? "Online — friends can join now." : "Reconnecting to the internet relay…")
       : st.linked ? "Connected to the host." : st.broker !== "open" ? "Reaching the connection service…" : st.noHost ? "No host is online with this code. Check the code, and that the host's page is open." : "Connecting to the host…";
     if (!mp.host && !host && !(st && !st.hub && !st.linked)) {
       el.append(h("p", { class: "warn" }, "No host found with this code on this server yet."));
