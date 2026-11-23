@@ -1233,7 +1233,8 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
 
 
   /** Tiny MQTT 3.1.1 client over WebSocket (QoS 0, retained messages, last will). */
-  function mqttConnect(url, clientId, will, onMsg, onState) {
+  function mqttConnect(relay, clientId, will, onMsg, onState) {
+    const url = typeof relay === "string" ? relay : relay.url;
     const te = new TextEncoder(), td = new TextDecoder();
     const str = s => { const b = te.encode(s); return [b.length >> 8, b.length & 255, ...b]; };
     const bin = b => [b.length >> 8, b.length & 255, ...b];
@@ -1250,6 +1251,7 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
       ws.onopen = () => {
         let flags = 0x02; const pay = [...str(clientId)];
         if (will) { flags |= 0x04 | 0x20; pay.push(...str(will.topic), ...bin(te.encode(will.payload))); }
+        if (relay.user) { flags |= 0x80 | 0x40; pay.push(...str(relay.user), ...str(relay.pass || "")); }
         ws.send(pkt(0x10, [...str("MQTT"), 4, flags, 0, 30, ...pay]));
       };
       ws.onmessage = ev => {
@@ -1285,7 +1287,11 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
    * and a "last will" clears it when a device drops off. Two independent public
    * relays are used at the same time; the newest copy (by sequence number) wins,
    * so one relay going down does not stop the game. */
-  const RELAYS = root.SAMETIME_RELAYS || ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt"];
+  // port 443 (shiftr) gets through networks that block unusual ports (some mobile carriers)
+  const RELAYS = root.SAMETIME_RELAYS || [
+    { name: "EMQX", url: "wss://broker.emqx.io:8084/mqtt" },
+    { name: "shiftr", url: "wss://public.cloud.shiftr.io", user: "public", pass: "public" },
+    { name: "Mosquitto", url: "wss://test.mosquitto.org:8081" }];
   const rid = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghijklmnopqrstuvwxyz0123456789"[b % 36]).join("");
 
   function onlineTransport() {
@@ -1337,8 +1343,8 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
           onPeers: fn => { listeners.add(fn); setTimeout(() => fn(list)); return () => listeners.delete(fn); },
           myPeer: () => label,
           connected: () => links.some(l => l.up()),
-          status: () => { const up = links.some(l => l.up()), hostHere = list.some(x => x.presence && x.presence.h && !x.isMe);
-            return { hub: !!(opts && opts.host), broker: up ? "open" : "connecting", linked: up && (opts && opts.host || hostHere), noHost: up && !hostHere && Date.now() - t0 > 6000 }; },
+          status: () => { const up = links.some(l => l.up()), relays = RELAYS.map((r, i) => ({ name: r.name || "relay " + (i + 1), up: links[i].up() })), hostHere = list.some(x => x.presence && x.presence.h && !x.isMe);
+            return { relays, hub: !!(opts && opts.host), broker: up ? "open" : "connecting", linked: up && (opts && opts.host || hostHere), noHost: up && !hostHere && Date.now() - t0 > 6000 }; },
           leave: () => { alive = false; clearInterval(keep); links.forEach(l => { l.publish(base + label, "", true); setTimeout(() => l.close(), 300); }); },
         };
       },
@@ -2348,13 +2354,14 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
       if (inv) { code.value = inv.toUpperCase(); setTimeout(() => { box.scrollIntoView({ behavior: "smooth", block: "center" }); nm.focus(); }, 300); }
       if (net.p2p) box.append(h("p", {}, inv ? h("b", {}, `You've been invited to game ${inv.toUpperCase()}. Type your name and tap “Join game”.`)
         : "Host on this device and send friends the code or invite link — they can be anywhere. Your device runs the game, so keep this screen open until it's over."));
-      box.append(h("p", { class: "hint" }, `Connected via ${net.label}. The host sets the options and computer generals above (the "Human" rows are ignored online — every player who joins gets a seat), then shares the game code.`),
+      box.append(h("p", { class: "hint" }, `Version ${VERSION}. Connected via ${net.label}. The host sets the options and computer generals above (the "Human" rows are ignored online — every player who joins gets a seat), then shares the game code.`),
         h("div", { class: "row" }, nm),
         h("div", { class: "row" },
           h("button", { class: "btn primary", onclick: () => {
             const ais = rows.map(r => r._get()).filter(x => x.type === "ai");
+            const openHumans = Math.max(1, rows.map(r => r._get()).filter(x => x.type === "human").length);
             const o = obj.value;
-            const tmpl = { objective: o === "capital" ? "capital" : "domination", dominationPercent: o === "capital" ? 100 : +o.slice(3), restricted: restricted.checked, map: mapSel.value, ais };
+            const tmpl = { objective: o === "capital" ? "capital" : "domination", dominationPercent: o === "capital" ? 100 : +o.slice(3), restricted: restricted.checked, map: mapSel.value, ais, openHumans };
             mpConnect(net, Math.random().toString(36).slice(2, 6).toUpperCase(), myName(), tmpl).catch(e => { msg.textContent = "Could not open a game: " + e.message; });
           } }, "Host a game"),
           h("span", { class: "muted" }, "or"), code,
@@ -2368,12 +2375,13 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
     return box;
   }
 
+  const VERSION = "2026-11-23c";
   async function mpConnect(net, code, myNameStr, tmpl) {
     audioInit();
     const room = await net.join(code.toLowerCase(), { host: !!tmpl });
     keepAwake();
     ui.mp = { net, room, code, host: !!tmpl, tmpl, name: myNameStr, started: false, applied: new Set(), takeovers: [], seatPeer: {}, warned: false };
-    await room.presence(tmpl ? { n: myNameStr, h: 1 } : { n: myNameStr });
+    await room.presence(tmpl ? { n: myNameStr, h: 1, jt: Date.now() } : { n: myNameStr, jt: Date.now() });
     room.onPeers(() => { try { mpCheck(); } catch (e) { console.error(e); } });
     setInterval(() => { try { mpCheck(); } catch (e) { console.error(e); } }, 2000);
     lobbyScreen();
@@ -2386,7 +2394,7 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
       h("div", { class: "card" }, h("h3", {}, mp.host ? "Your game is open" : "Joined game"),
         h("p", {}, "Game code: ", h("span", { class: "code" }, mp.code)),
         mp.net.server ? h("p", {}, "Server: ", h("b", {}, mp.net.server.shareUrl), mp.net.server.isLocal ? h("small", { class: "muted" }, " (this computer)") : null) : null,
-        h("p", { class: "hint" }, mp.host ? (mp.net.server ? `Other players open ${mp.net.server.shareUrl} on their own computers (do NOT run “Host network game” there), choose “Join game” and type this code. Start when everyone is listed.` : "Tell the other players this code. They open the same page, choose “Join game” and type it. Start when everyone is listed.") : "Waiting for the host to start the game…"),
+        h("p", { class: "hint" }, mp.host ? (mp.net.server ? `Other players open ${mp.net.server.shareUrl} on their own computers (do NOT run “Host network game” there), choose “Join game” and type this code. Start when everyone is listed.` : "Send the invite link or code. Each player who joins appears below; start when everyone is in. If the game is full, joining players take over computer seats.") : "Waiting for the host to start the game…"),
         mp.host && mp.net.p2p ? inviteRow(mp.code) : null,
         mp.net.p2p ? h("p", { class: "hint" }, mp.host ? "Your device is the game's host: keep this page open and the screen on until the game ends (the game tries to stop the screen sleeping). If you switch apps, players reconnect when you come back." : "Keep this page open while you play. If your connection drops, it reconnects by itself.") : null,
         h("div", { id: "netstat", class: "hint" }),
@@ -2416,8 +2424,27 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
     const peers = mp.room.peers().filter(p => p.presence && p.presence.n);
     el.innerHTML = "";
     const host = peers.find(p => p.presence.h);
-    for (const p of peers) el.append(h("div", { class: "prow" }, h("span", { class: "chip", style: "background:#888" }), h("span", { class: "pname" }, p.presence.n, p.presence.h ? h("small", {}, " host") : null, p.isMe ? h("small", {}, " (you)") : null)));
-    if (mp.host && mp.tmpl) for (const a of mp.tmpl.ais) el.append(h("div", { class: "prow" }, h("span", { class: "chip", style: "background:#555" }), h("span", { class: "pname" }, a.name, h("small", {}, " computer"))));
+    // seat plan: the host computes it and shares it, so every lobby shows the same seats
+    let lb = null;
+    if (mp.host && mp.tmpl) {
+      const L = lobbySeats();
+      lb = L.humans.map(p => [p.presence.n, p.presence.h ? "host" : "human", p.peer]).concat(L.ais.map(a => [a.name, "ai"]))
+        .concat(Array.from({ length: L.open }, () => ["", "open"])).concat(L.dropped.map(a => [a.name, "replaced"])).concat(L.watchers.map(p => [p.presence.n, "watch", p.peer]));
+      const key = JSON.stringify(lb); if (key !== mp.lbKey) { mp.lbKey = key; mp.room.presence({ lb }); }
+    } else if (host && host.presence.lb) lb = host.presence.lb;
+    const myPeer = mp.room.myPeer();
+    if (lb) {
+      let seatNo = 0;
+      for (const [nm, kind, peer] of lb) {
+        const seated = kind === "host" || kind === "human" || kind === "ai", col = seated ? G.PLAYER_COLORS[seatNo++] : "#3a4350";
+        const tag = { host: " host", human: " joined", ai: " computer", open: "", replaced: " computer — replaced by a joining player", watch: " watching (game is full)" }[kind];
+        el.append(h("div", { class: "prow" + (peer && peer === myPeer ? " me" : ""), style: kind === "replaced" || kind === "open" ? "opacity:.55" : "" },
+          h("span", { class: "chip", style: `background:${col}` }),
+          h("span", { class: "pname" }, kind === "open" ? "Open seat — waiting for a player…" : nm, h("small", {}, tag), peer && peer === myPeer ? h("small", {}, " (you)") : null)));
+      }
+    } else for (const p of peers) el.append(h("div", { class: "prow" }, h("span", { class: "chip", style: "background:#888" }), h("span", { class: "pname" }, p.presence.n, p.presence.h ? h("small", {}, " host") : null, p.isMe ? h("small", {}, " (you)") : null)));
+    const rs = mp.room.status ? mp.room.status() : null;
+    if (rs && rs.relays) el.append(h("p", { class: "hint", style: "font-size:12px;margin-top:10px" }, "Relays: " + rs.relays.map(r => `${r.name} ${r.up ? "✓" : "✗"}`).join(" · ") + " · version " + VERSION));
     const ns = $("#netstat"), st = mp.room.status ? mp.room.status() : null;
     if (ns && st) ns.textContent = st.hub ? (st.broker === "open" ? "Online — friends can join now." : "Reconnecting to the internet relay…")
       : st.linked ? "Connected to the host." : st.broker !== "open" ? "Reaching the connection service…" : st.noHost ? "No host is online with this code. Check the code, and that the host's page is open." : "Connecting to the host…";
@@ -2427,12 +2454,23 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
         ? "You are on a server running on YOUR computer, so you can't see a host on another computer. Close this, then open the address shown in the host's server window (e.g. http://192.168.1.23:8765/) — or double-click “Join network game.bat” and type it."
         : `Check that the host's page shows the same server address (${mp.net.server.shareUrl}) and the same code.`));
     }
-    const btn = $("#mpstart"); if (btn) { const n = peers.length + mp.tmpl.ais.length; btn.disabled = n < 2 || n > 8; btn.textContent = n > 8 ? "Too many players (max 8)" : `Start the game (${n} players)`; }
+    const btn = $("#mpstart"); if (btn) { const L = lobbySeats(), n = L.humans.length + L.ais.length; btn.disabled = n < 2; btn.textContent = `Start the game (${n} players)`; }
+  }
+  /** Joining players fill open human seats, then closed slots (up to 8), then replace computer players (last first). */
+  function lobbySeats() {
+    const mp = ui.mp;
+    const all = mp.room.peers().filter(p => p.presence && p.presence.n)
+      .sort((a, b) => (b.presence.h ? 1 : 0) - (a.presence.h ? 1 : 0) || (a.presence.jt || 0) - (b.presence.jt || 0) || (a.peer < b.peer ? -1 : 1));
+    const humans = all.slice(0, 8), watchers = all.slice(8);
+    const keep = Math.max(0, Math.min(mp.tmpl.ais.length, 8 - humans.length));
+    const ais = mp.tmpl.ais.slice(0, keep), dropped = mp.tmpl.ais.slice(keep);
+    const open = Math.max(0, Math.min((mp.tmpl.openHumans || 1) - humans.length, 8 - humans.length - ais.length));
+    return { humans, ais, dropped, open, watchers };
   }
   function mpStart() {
     const mp = ui.mp;
-    const humansP = mp.room.peers().filter(p => p.presence && p.presence.n).sort((a, b) => (b.presence.h ? 1 : 0) - (a.presence.h ? 1 : 0) || (a.peer < b.peer ? -1 : 1));
-    const seats = humansP.map(p => ({ type: "human", name: String(p.presence.n).slice(0, 20) })).concat(mp.tmpl.ais);
+    const L = lobbySeats(), humansP = L.humans;
+    const seats = humansP.map(p => ({ type: "human", name: String(p.presence.n).slice(0, 20) })).concat(L.ais);
     const cfg = { seed: Math.floor(Math.random() * 1e9), seats, objective: mp.tmpl.objective, dominationPercent: mp.tmpl.dominationPercent, restricted: mp.tmpl.restricted, map: mp.tmpl.map, online: true };
     mp.room.presence({ st: { cfg, peers: humansP.map(p => p.peer) } });
     mpCheck();
