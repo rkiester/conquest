@@ -1366,6 +1366,16 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
 <script>if (/^https?:$/.test(location.protocol) && !/claude\.ai$|claudeusercontent/.test(location.hostname)) document.write('<script src="patch.js?v=' + Math.floor(Date.now() / 6e4) + '"><\/script>');</script>
 <script>/* Browser UI. Reads game state, sends player input to the game layer; never mutates rules. */
 (function () {
+  const VERSION = "2026-11-23d";
+  /** Web copies: if the server has a newer build than this (cached) page, reload it fresh. */
+  function selfUpdate() {
+    if (!/^https?:$/.test(location.protocol) || /claude\.ai$|claudeusercontent/.test(location.hostname)) return;
+    fetch(location.pathname + "?nocache=" + Date.now(), { cache: "no-store" }).then(r => r.ok ? r.text() : "").then(t => {
+      const m = t.match(/const VERSION = "([^"]+)"/);
+      if (m && m[1] !== VERSION && !new URLSearchParams(location.search).has("updated")) location.replace(location.pathname + "?v=" + m[1] + "&updated=1" + location.hash);
+    }).catch(() => {});
+  }
+  selfUpdate();
   "use strict";
   const E = window.SameTime, G = window.SameTimeGame;
   const RULES_DB = window.SAMETIME_RULES;
@@ -2375,13 +2385,12 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
     return box;
   }
 
-  const VERSION = "2026-11-23c";
   async function mpConnect(net, code, myNameStr, tmpl) {
     audioInit();
     const room = await net.join(code.toLowerCase(), { host: !!tmpl });
     keepAwake();
     ui.mp = { net, room, code, host: !!tmpl, tmpl, name: myNameStr, started: false, applied: new Set(), takeovers: [], seatPeer: {}, warned: false };
-    await room.presence(tmpl ? { n: myNameStr, h: 1, jt: Date.now() } : { n: myNameStr, jt: Date.now() });
+    await room.presence(tmpl ? { n: myNameStr, h: 1, jt: Date.now(), v: VERSION } : { n: myNameStr, jt: Date.now(), v: VERSION });
     room.onPeers(() => { try { mpCheck(); } catch (e) { console.error(e); } });
     setInterval(() => { try { mpCheck(); } catch (e) { console.error(e); } }, 2000);
     lobbyScreen();
@@ -2404,7 +2413,7 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
     mpRenderLobby();
     if (mp.net.p2p) { clearInterval(ui.netTimer); ui.netTimer = setInterval(() => { if (!$("#lobbylist")) return clearInterval(ui.netTimer); mpRenderLobby(); }, 1500); }
   }
-  function inviteUrl(code) { return location.href.split("#")[0] + "#join=" + code; }
+  function inviteUrl(code) { return /^https?:$/.test(location.protocol) ? location.origin + location.pathname + "?v=" + VERSION + "#join=" + code : location.href.split("#")[0] + "#join=" + code; }
   function inviteRow(code) {
     const url = inviteUrl(code), note = h("span", { class: "muted" });
     const copy = () => { (navigator.clipboard ? navigator.clipboard.writeText(url) : Promise.reject()).then(() => { note.textContent = " Link copied."; }, () => { note.textContent = " " + url; }); };
@@ -2433,6 +2442,8 @@ window.SAMETIME_GEO={"note":"Territory outlines derived from Natural Earth 1:50m
       const key = JSON.stringify(lb); if (key !== mp.lbKey) { mp.lbKey = key; mp.room.presence({ lb }); }
     } else if (host && host.presence.lb) lb = host.presence.lb;
     const myPeer = mp.room.myPeer();
+    if (!mp.host && host && host.presence.v !== VERSION) el.append(h("p", { class: "warn" }, `This page (version ${VERSION}) doesn't match the host's (${host.presence.v || "older"}). Reload here; if it still doesn't match, the host should reload too. `,
+      h("button", { class: "btn small primary", onclick: () => location.replace(location.pathname + "?v=" + Date.now() + "#join=" + mp.code) }, "Reload and rejoin")));
     if (lb) {
       let seatNo = 0;
       for (const [nm, kind, peer] of lb) {
